@@ -160,9 +160,11 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
             for s in &suggestions {
                 let default_selected = matches!(s.risk_level, RiskLevel::Safe);
 
+                let title_text = glib::markup_escape_text(&s.description);
+                let subtitle_text = glib::markup_escape_text(&suggestion_subtitle(s, lang));
                 let row = adw::ActionRow::builder()
-                    .title(&s.description)
-                    .subtitle(&suggestion_subtitle(s, lang))
+                    .title(title_text)
+                    .subtitle(subtitle_text)
                     .build();
                 row.set_tooltip_text(Some(&s.command));
 

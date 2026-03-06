@@ -1,7 +1,7 @@
 use adw::prelude::*;
 use gtk::glib;
-use std::cmp::Ordering;
 use std::cell::{Cell, RefCell};
+use std::cmp::Ordering;
 use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -332,11 +332,7 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
     content_box.set_margin_start(12);
     content_box.set_margin_end(12);
 
-    let list_title = gtk::Label::new(Some(pick(
-        lang,
-        "后台进程",
-        "Background processes",
-    )));
+    let list_title = gtk::Label::new(Some(pick(lang, "后台进程", "Background processes")));
     list_title.set_halign(gtk::Align::Start);
     list_title.add_css_class("caption");
     content_box.append(&list_title);
@@ -474,7 +470,9 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
             }
 
             let label = match lang {
-                Language::ZhCn => format!("已选择 {count} 项 · RSS 合计 {}", format_size(total_rss)),
+                Language::ZhCn => {
+                    format!("已选择 {count} 项 · RSS 合计 {}", format_size(total_rss))
+                }
                 Language::En => format!("Selected {count} · total RSS {}", format_size(total_rss)),
             };
             summary_label.set_label(&label);
@@ -674,11 +672,7 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
                 .collect();
             candidates.sort_by(|a, b| b.1.cmp(&a.1));
 
-            let targets: Vec<u32> = candidates
-                .into_iter()
-                .take(6)
-                .map(|(pid, _)| pid)
-                .collect();
+            let targets: Vec<u32> = candidates.into_iter().take(6).map(|(pid, _)| pid).collect();
 
             if targets.is_empty() {
                 banner.set_title(pick(
@@ -941,8 +935,11 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
                 *memory_state.borrow_mut() = event.memory;
                 *processes_state.borrow_mut() = event.processes;
                 // 剔除已不存在的选择项，避免对新 PID 误操作。
-                let existing: HashSet<u32> = processes_state.borrow().iter().map(|p| p.pid).collect();
-                selection_state.borrow_mut().retain(|pid| existing.contains(pid));
+                let existing: HashSet<u32> =
+                    processes_state.borrow().iter().map(|p| p.pid).collect();
+                selection_state
+                    .borrow_mut()
+                    .retain(|pid| existing.contains(pid));
 
                 update_overview();
                 rebuild_list();
@@ -966,8 +963,14 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
 }
 
 enum TerminateEvent {
-    Message { text: String },
-    Progress { current: usize, total: usize, pid: u32 },
+    Message {
+        text: String,
+    },
+    Progress {
+        current: usize,
+        total: usize,
+        pid: u32,
+    },
     Finished {
         terminated: usize,
         still_running: usize,
@@ -1087,12 +1090,12 @@ fn confirm_text(pids: &[u32], signal: TerminateSignal, lang: Language) -> String
         TerminateSignal::Kill => "SIGKILL",
     };
     match lang {
-        Language::ZhCn => format!(
-            "将对 {count} 个进程发送 {sig}。\n可能导致未保存数据丢失，确定继续吗？"
-        ),
-        Language::En => format!(
-            "Send {sig} to {count} process(es).\nUnsaved data may be lost. Continue?"
-        ),
+        Language::ZhCn => {
+            format!("将对 {count} 个进程发送 {sig}。\n可能导致未保存数据丢失，确定继续吗？")
+        }
+        Language::En => {
+            format!("Send {sig} to {count} process(es).\nUnsaved data may be lost. Continue?")
+        }
     }
 }
 
@@ -1120,7 +1123,12 @@ fn usage_level_label(
     }
 }
 
-fn set_pm_usage_bar(bar: &gtk::ProgressBar, fraction: f64, high_threshold: f64, mid_threshold: f64) {
+fn set_pm_usage_bar(
+    bar: &gtk::ProgressBar,
+    fraction: f64,
+    high_threshold: f64,
+    mid_threshold: f64,
+) {
     let fraction = fraction.clamp(0.0, 1.0);
     bar.set_show_text(false);
     bar.set_fraction(fraction);
@@ -1224,7 +1232,11 @@ fn render_process_list(
         (None, None) => a.pid.cmp(&b.pid),
     });
 
-    let max_rss = filtered.iter().filter_map(|p| p.rss_bytes).max().unwrap_or(0);
+    let max_rss = filtered
+        .iter()
+        .filter_map(|p| p.rss_bytes)
+        .max()
+        .unwrap_or(0);
     let queue = Rc::new(RefCell::new(VecDeque::from(filtered)));
 
     // 不立即清空旧列表，避免刷新时出现短暂白屏。等新列表渲染完成后再原子替换。
@@ -1253,9 +1265,12 @@ fn render_process_list(
 
             let allowed = process_manager::can_terminate(current_uid, self_pid, &p);
 
+            let title_text = glib::markup_escape_text(&format!("{} (PID {})", p.name, p.pid));
+            let subtitle_text =
+                glib::markup_escape_text(&process_subtitle(&p, allowed, lang));
             let row = adw::ActionRow::builder()
-                .title(&format!("{} (PID {})", p.name, p.pid))
-                .subtitle(&process_subtitle(&p, allowed, lang))
+                .title(title_text)
+                .subtitle(subtitle_text)
                 .build();
             row.set_tooltip_text(p.cmdline.as_deref());
 
@@ -1264,6 +1279,15 @@ fn render_process_list(
             check.set_sensitive(allowed);
             check.set_active(selection_for_tick.borrow().contains(&p.pid));
             row.add_prefix(&check);
+
+            let icon_name = p
+                .icon_name
+                .as_deref()
+                .unwrap_or("application-x-executable-symbolic");
+            let icon = gtk::Image::from_icon_name(icon_name);
+            icon.set_pixel_size(20);
+            icon.set_valign(gtk::Align::Center);
+            row.add_prefix(&icon);
 
             let suffix_box = gtk::Box::new(gtk::Orientation::Vertical, 3);
             suffix_box.set_halign(gtk::Align::End);
@@ -1286,7 +1310,8 @@ fn render_process_list(
             share_label.add_css_class("caption");
             share_label.add_css_class("dim-label");
 
-            let rss_label = gtk::Label::new(Some(&p.rss_bytes.map_or_else(|| "-".into(), format_size)));
+            let rss_label =
+                gtk::Label::new(Some(&p.rss_bytes.map_or_else(|| "-".into(), format_size)));
             rss_label.add_css_class("pm-row-rss");
             rss_label.add_css_class("monospace");
             rss_label.set_xalign(1.0);
@@ -1380,10 +1405,7 @@ fn process_subtitle(p: &ProcessInfo, allowed: bool, lang: Language) -> String {
 
 fn format_memory_overview(m: &process_manager::MemorySnapshot, lang: Language) -> String {
     let used = m.mem_used().map(format_size).unwrap_or_else(|| "-".into());
-    let total = m
-        .mem_total
-        .map(format_size)
-        .unwrap_or_else(|| "-".into());
+    let total = m.mem_total.map(format_size).unwrap_or_else(|| "-".into());
     let avail = m
         .mem_available
         .map(format_size)
@@ -1397,10 +1419,7 @@ fn format_memory_overview(m: &process_manager::MemorySnapshot, lang: Language) -
 
 fn format_swap_overview(m: &process_manager::MemorySnapshot) -> String {
     let used = m.swap_used().map(format_size).unwrap_or_else(|| "-".into());
-    let total = m
-        .swap_total
-        .map(format_size)
-        .unwrap_or_else(|| "-".into());
+    let total = m.swap_total.map(format_size).unwrap_or_else(|| "-".into());
     format!("{used} / {total}")
 }
 
@@ -1455,6 +1474,7 @@ mod tests {
             uid: 1000,
             rss_bytes: Some(123),
             cmdline: Some("/usr/bin/google-chrome --type=renderer".into()),
+            icon_name: None,
         };
         assert!(matches_query(&p, "chrome"));
         assert!(matches_query(&p, "RENDERER"));

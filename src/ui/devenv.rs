@@ -75,9 +75,19 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
             group.set_title(&capitalize(&event.language));
 
             for rt in &event.runtimes {
+                let title_text = glib::markup_escape_text(&format!(
+                    "{} {}",
+                    capitalize(&rt.language),
+                    &rt.version
+                ));
+                let subtitle_text = glib::markup_escape_text(&format!(
+                    "{} ({})",
+                    &rt.path,
+                    &rt.install_method
+                ));
                 let row = adw::ActionRow::builder()
-                    .title(&format!("{} {}", capitalize(&rt.language), &rt.version))
-                    .subtitle(&format!("{} ({})", &rt.path, &rt.install_method))
+                    .title(title_text)
+                    .subtitle(subtitle_text)
                     .build();
                 group.add(&row);
             }
@@ -99,8 +109,8 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
                         .join(", ")
                 };
                 let row = adw::ActionRow::builder()
-                    .title(&vm.name)
-                    .subtitle(&versions_str)
+                    .title(glib::markup_escape_text(&vm.name))
+                    .subtitle(glib::markup_escape_text(&versions_str))
                     .build();
                 group.add(&row);
             }
@@ -123,9 +133,11 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
                         } else {
                             format!("{} {}", manager, pkg.version)
                         };
+                        let title_text = glib::markup_escape_text(&pkg.name);
+                        let subtitle_text = glib::markup_escape_text(&subtitle);
                         let child = adw::ActionRow::builder()
-                            .title(&pkg.name)
-                            .subtitle(&subtitle)
+                            .title(title_text)
+                            .subtitle(subtitle_text)
                             .build();
                         expander.add_row(&child);
                     }

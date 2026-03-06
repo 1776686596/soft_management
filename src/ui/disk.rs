@@ -148,9 +148,20 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
         .icon_name("drive-harddisk-symbolic")
         .build();
 
+    let cancelled_page = adw::StatusPage::builder()
+        .title(pick(lang, "已取消", "Cancelled"))
+        .description(pick(
+            lang,
+            "扫描已取消，可点击“重新扫描”再试",
+            "Scan cancelled; click “Rescan” to try again",
+        ))
+        .icon_name("process-stop-symbolic")
+        .build();
+
     let stack = gtk::Stack::new();
     stack.add_named(&loading_page, Some("loading"));
     stack.add_named(&empty_page, Some("empty"));
+    stack.add_named(&cancelled_page, Some("cancelled"));
 
     let main_paned = gtk::Paned::new(gtk::Orientation::Horizontal);
     main_paned.set_wide_handle(true);
@@ -197,6 +208,10 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
     let rescan_button = gtk::Button::with_label(pick(lang, "重新扫描", "Rescan"));
     rescan_button.add_css_class("suggested-action");
 
+    let cancel_button = gtk::Button::with_label(pick(lang, "取消", "Cancel"));
+    cancel_button.add_css_class("flat");
+    cancel_button.set_sensitive(false);
+
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
 
@@ -214,6 +229,7 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
     toolbar_row.append(&up_button);
     toolbar_row.append(&mode_toggle);
     toolbar_row.append(&rescan_button);
+    toolbar_row.append(&cancel_button);
     toolbar_row.append(&spacer);
     toolbar_row.append(&mode_badge);
     toolbar_row.append(&summary_badge);
@@ -232,6 +248,14 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
     let status_label = gtk::Label::new(None);
     status_label.set_halign(gtk::Align::Start);
     status_label.add_css_class("caption");
+
+    let scan_progress = gtk::ProgressBar::new();
+    scan_progress.set_hexpand(true);
+    scan_progress.set_show_text(true);
+    scan_progress.add_css_class("disk-usage-bar");
+    scan_progress.set_fraction(0.0);
+    scan_progress.set_text(Some(pick(lang, "准备中", "Preparing")));
+    scan_progress.set_visible(false);
 
     let treemap_area = gtk::DrawingArea::new();
     treemap_area.set_hexpand(true);
@@ -253,6 +277,7 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
 
     left_box.append(&toolbar_row);
     left_box.append(&breadcrumb_scrolled);
+    left_box.append(&scan_progress);
     left_box.append(&status_label);
     left_box.append(&treemap_frame);
 
@@ -498,6 +523,7 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
     let dataset_state: Rc<RefCell<Option<DiskDataset>>> = Rc::new(RefCell::new(None));
     let render_cell: Rc<RefCell<Option<Box<dyn Fn()>>>> = Rc::new(RefCell::new(None));
     let active_scan_id = Rc::new(RefCell::new(0u64));
+    let scan_task_token = Rc::new(RefCell::new(None::<tokio_util::sync::CancellationToken>));
     treemap_area.set_has_tooltip(true);
     let motion = gtk::EventControllerMotion::new();
     {
@@ -795,12 +821,12 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
                 };
 
                 let row = adw::ActionRow::builder()
-                    .title(&format!("{}. {}", idx + 1, item.name))
-                    .subtitle(&format!(
+                    .title(glib::markup_escape_text(&format!("{}. {}", idx + 1, item.name)))
+                    .subtitle(glib::markup_escape_text(&format!(
                         "{} · {}",
                         kind,
                         compact_path_for_label(&item.path, 72)
-                    ))
+                    )))
                     .build();
                 row.set_tooltip_text(Some(&item.path));
                 row.add_prefix(&gtk::Image::from_icon_name(icon_name));
@@ -1001,10 +1027,25 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
         let scan_badge = scan_badge.clone();
         let stack = stack.clone();
         let dataset_state = dataset_state.clone();
+        let scan_task_token = scan_task_token.clone();
+        let cancel_button = cancel_button.clone();
+        let scan_progress = scan_progress.clone();
 
         Rc::new(move |mode: disk::ScanMode| {
+            if let Some(prev) = scan_task_token.borrow_mut().take() {
+                prev.cancel();
+            }
+
+            let scan_token = token.child_token();
+            *scan_task_token.borrow_mut() = Some(scan_token.clone());
+
             let scan_id = SCAN_SEQ.fetch_add(1, Ordering::Relaxed);
             *active_scan_id.borrow_mut() = scan_id;
+
+            cancel_button.set_sensitive(true);
+            scan_progress.set_fraction(0.0);
+            scan_progress.set_text(Some(pick(lang, "准备中", "Preparing")));
+            scan_progress.set_visible(true);
 
             scan_badge.set_label(match mode {
                 disk::ScanMode::Fast => pick(lang, "扫描中（快速）", "Scanning (Fast)"),
@@ -1015,13 +1056,40 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
                 stack.set_visible_child_name("loading");
             }
 
-            let token_clone = token.clone();
             let tx_clone = tx_for_rescan.clone();
             runtime::spawn(async move {
-                disk::scan_all(tx_clone, token_clone, mode, scan_id).await;
+                disk::scan_all(tx_clone, scan_token, mode, scan_id).await;
             });
         })
     };
+
+    {
+        let scan_task_token = scan_task_token.clone();
+        let active_scan_id = active_scan_id.clone();
+        let scan_badge = scan_badge.clone();
+        let cancel_button = cancel_button.clone();
+        let scan_progress = scan_progress.clone();
+        let stack = stack.clone();
+        let dataset_state = dataset_state.clone();
+
+        cancel_button.connect_clicked({
+            let cancel_button = cancel_button.clone();
+            move |_| {
+                if let Some(token) = scan_task_token.borrow_mut().take() {
+                    token.cancel();
+                }
+                *active_scan_id.borrow_mut() = 0;
+
+                cancel_button.set_sensitive(false);
+                scan_progress.set_visible(false);
+                scan_badge.set_label(pick(lang, "已取消", "Cancelled"));
+
+                if dataset_state.borrow().is_none() {
+                    stack.set_visible_child_name("cancelled");
+                }
+            }
+        });
+    }
 
     {
         let start_scan = start_scan.clone();
@@ -1055,87 +1123,115 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
 
     glib::spawn_future_local(async move {
         while let Ok(event) = rx.recv().await {
-            if event.scan_id != *active_scan_id.borrow() {
-                continue;
+            match event {
+                disk::DiskEvent::Progress(progress) => {
+                    if progress.scan_id != *active_scan_id.borrow() {
+                        continue;
+                    }
+
+                    scan_progress.set_text(Some(&format_disk_progress(&progress, lang)));
+                    scan_progress.set_visible(true);
+
+                    let fraction = if progress.total == 0 || progress.total == u32::MAX {
+                        0.0
+                    } else if progress.stage == disk::DiskStage::Finished {
+                        1.0
+                    } else {
+                        (f64::from(progress.done) / f64::from(progress.total)).clamp(0.0, 1.0)
+                    };
+                    scan_progress.set_fraction(fraction);
+
+                    if progress.stage == disk::DiskStage::Finished {
+                        cancel_button.set_sensitive(false);
+                        scan_progress.set_visible(false);
+                    }
+                }
+                disk::DiskEvent::Snapshot(snapshot) => {
+                    if snapshot.scan_id != *active_scan_id.borrow() {
+                        continue;
+                    }
+
+                    if snapshot.folder_usage.is_empty() {
+                        *dataset_state.borrow_mut() = None;
+                        summary_badge.set_label(pick(lang, "无数据", "No data"));
+                        scan_badge.set_label(pick(lang, "扫描完成", "Scan finished"));
+                        cancel_button.set_sensitive(false);
+                        scan_progress.set_visible(false);
+                        stack.set_visible_child_name("empty");
+                        continue;
+                    }
+
+                    let mut roots = snapshot.roots;
+                    roots.sort();
+                    roots.dedup();
+
+                    let root_labels: HashMap<String, String> = snapshot
+                        .caches
+                        .iter()
+                        .map(|cache| (normalize_path(&cache.path), cache.name.clone()))
+                        .collect();
+
+                    let mut root_labels = root_labels;
+                    root_labels
+                        .entry("/".to_string())
+                        .or_insert_with(|| pick(lang, "完整文件系统", "Full Filesystem").to_string());
+                    if let Ok(home) = std::env::var("HOME") {
+                        let home_key = normalize_path(&home);
+                        root_labels
+                            .entry(home_key)
+                            .or_insert_with(|| pick(lang, "用户主目录", "Home Directory").to_string());
+                    }
+
+                    if snapshot.folder_usage.values().all(Vec::is_empty) {
+                        *dataset_state.borrow_mut() = None;
+                        summary_badge.set_label(pick(lang, "无数据", "No data"));
+                        scan_badge.set_label(pick(lang, "扫描完成", "Scan finished"));
+                        cancel_button.set_sensitive(false);
+                        scan_progress.set_visible(false);
+                        stack.set_visible_child_name("empty");
+                        continue;
+                    }
+
+                    let new_dataset = DiskDataset {
+                        children_map: snapshot.folder_usage,
+                        roots,
+                        root_labels,
+                    };
+
+                    let requested_root = normalize_path(current_root.borrow().as_str());
+                    let next_root = if requested_root == "/"
+                        || new_dataset.children_map.contains_key(&requested_root)
+                        || new_dataset.roots.iter().any(|root| root == &requested_root)
+                    {
+                        requested_root
+                    } else {
+                        "/".to_string()
+                    };
+
+                    *dataset_state.borrow_mut() = Some(new_dataset);
+                    *current_root.borrow_mut() = next_root;
+
+                    if snapshot.is_final {
+                        scan_badge.set_label(pick(lang, "扫描完成", "Scan finished"));
+                        cancel_button.set_sensitive(false);
+                        scan_progress.set_visible(false);
+                    } else {
+                        scan_badge.set_label(pick(
+                            lang,
+                            "快速结果已就绪，继续扫描 / ...",
+                            "Fast result ready, scanning / ...",
+                        ));
+                        cancel_button.set_sensitive(true);
+                        scan_progress.set_visible(true);
+                    }
+
+                    if let Some(render) = &*render_cell.borrow() {
+                        render();
+                    }
+
+                    stack.set_visible_child_name("content");
+                }
             }
-
-            if event.folder_usage.is_empty() {
-                *dataset_state.borrow_mut() = None;
-                summary_badge.set_label(pick(lang, "无数据", "No data"));
-                scan_badge.set_label(pick(lang, "扫描完成", "Scan finished"));
-                stack.set_visible_child_name("empty");
-                continue;
-            }
-
-            let mut roots = event.roots;
-            roots.sort();
-            roots.dedup();
-
-            let root_labels: HashMap<String, String> = event
-                .caches
-                .iter()
-                .map(|cache| (normalize_path(&cache.path), cache.name.clone()))
-                .collect();
-
-            let mut root_labels = root_labels;
-            root_labels
-                .entry("/".to_string())
-                .or_insert_with(|| pick(lang, "完整文件系统", "Full Filesystem").to_string());
-            if let Ok(home) = std::env::var("HOME") {
-                let home_key = normalize_path(&home);
-                root_labels
-                    .entry(home_key)
-                    .or_insert_with(|| pick(lang, "用户主目录", "Home Directory").to_string());
-            }
-
-            if event.folder_usage.values().all(Vec::is_empty) {
-                *dataset_state.borrow_mut() = None;
-                summary_badge.set_label(pick(lang, "无数据", "No data"));
-                scan_badge.set_label(pick(lang, "扫描完成", "Scan finished"));
-                stack.set_visible_child_name("empty");
-                continue;
-            }
-
-            let new_dataset = DiskDataset {
-                children_map: event.folder_usage,
-                roots,
-                root_labels,
-            };
-
-            let requested_root = normalize_path(current_root.borrow().as_str());
-            let next_root = if requested_root == "/"
-                || new_dataset.children_map.contains_key(&requested_root)
-                || new_dataset.roots.iter().any(|root| root == &requested_root)
-            {
-                requested_root
-            } else {
-                "/".to_string()
-            };
-
-            *dataset_state.borrow_mut() = Some(new_dataset);
-            *current_root.borrow_mut() = next_root;
-
-            let full_mode_in_progress = mode_toggle.is_active()
-                && !dataset_state
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|d| d.children_map.contains_key("/"));
-
-            if full_mode_in_progress {
-                scan_badge.set_label(pick(
-                    lang,
-                    "快速结果已就绪，继续扫描 / ...",
-                    "Fast result ready, scanning / ...",
-                ));
-            } else {
-                scan_badge.set_label(pick(lang, "扫描完成", "Scan finished"));
-            }
-
-            if let Some(render) = &*render_cell.borrow() {
-                render();
-            }
-
-            stack.set_visible_child_name("content");
         }
     });
 
@@ -2031,5 +2127,82 @@ fn format_size(bytes: u64) -> String {
         format!("{:.0} KB", bytes as f64 / KB as f64)
     } else {
         format!("{bytes} B")
+    }
+}
+
+fn format_duration_ms(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    let secs = total_secs % 60;
+    let mins = (total_secs / 60) % 60;
+    let hours = total_secs / 3600;
+    if hours > 0 {
+        format!("{hours}:{mins:02}:{secs:02}")
+    } else {
+        format!("{mins}:{secs:02}")
+    }
+}
+
+fn format_disk_progress(progress: &disk::DiskProgress, lang: Language) -> String {
+    let elapsed = format_duration_ms(progress.elapsed_ms);
+    let eta = progress
+        .eta_ms
+        .filter(|v| *v > 0)
+        .map(format_duration_ms);
+
+    match progress.stage {
+        disk::DiskStage::ScanningCaches => {
+            let current = progress.current.as_deref().unwrap_or("-");
+            match lang {
+                Language::ZhCn => format!("扫描缓存：{current} · 已耗时 {elapsed}"),
+                Language::En => format!("Scanning caches: {current} · Elapsed {elapsed}"),
+            }
+        }
+        disk::DiskStage::AnalyzingRoots => {
+            let count = if progress.total > 0 && progress.total != u32::MAX {
+                format!("{}/{}", progress.done, progress.total)
+            } else {
+                "-".to_string()
+            };
+
+            let current_part = progress
+                .current
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .map(|v| match lang {
+                    Language::ZhCn => format!(" · 当前 {v}"),
+                    Language::En => format!(" · Current {v}"),
+                })
+                .unwrap_or_default();
+
+            let files_part = if progress.scanned_files > 0 {
+                match lang {
+                    Language::ZhCn => format!(" · 已扫描 {} 文件", progress.scanned_files),
+                    Language::En => format!(" · {} files", progress.scanned_files),
+                }
+            } else {
+                String::new()
+            };
+
+            let eta_part = eta
+                .as_deref()
+                .map(|v| match lang {
+                    Language::ZhCn => format!(" · 预计剩余 {v}"),
+                    Language::En => format!(" · ETA {v}"),
+                })
+                .unwrap_or_default();
+
+            match lang {
+                Language::ZhCn => {
+                    format!("已完成 {count}{current_part}{files_part} · 已耗时 {elapsed}{eta_part}")
+                }
+                Language::En => {
+                    format!("Done {count}{current_part}{files_part} · Elapsed {elapsed}{eta_part}")
+                }
+            }
+        }
+        disk::DiskStage::Finished => match lang {
+            Language::ZhCn => format!("完成 · 总耗时 {elapsed}"),
+            Language::En => format!("Done · Elapsed {elapsed}"),
+        },
     }
 }

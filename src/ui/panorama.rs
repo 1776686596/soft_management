@@ -1,13 +1,17 @@
 use adw::prelude::*;
+use freedesktop_desktop_entry::DesktopEntry;
 use gtk::glib;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Once;
+use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
+use crate::adapters::util::command_exists;
 use crate::i18n::{pick, Language};
 use crate::models::{parse_canonical_id, Package};
 use crate::runtime;
@@ -18,10 +22,13 @@ use crate::subprocess::run_command;
 struct SelectedPackage {
     canonical_id: String,
     source: String,
+    install_method: String,
     install_path: Option<String>,
     desktop_file: Option<String>,
+    uninstall_command: Option<String>,
 }
 
+#[derive(Clone, Debug)]
 struct SizePathCandidate {
     path: String,
     recursive: bool,
@@ -74,6 +81,37 @@ struct SizeEntry {
 struct SizeScanResult {
     total_size: u64,
     entries: Vec<SizeEntry>,
+    targets: Vec<SizePathCandidate>,
+    truncated: bool,
+    permission_denied: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SizeScanPhase {
+    PreparingTargets,
+    ScanningTargets,
+}
+
+#[derive(Clone, Debug)]
+struct SizeScanProgress {
+    phase: SizeScanPhase,
+    current_path: Option<String>,
+    targets_done: usize,
+    targets_total: usize,
+    scanned_files: usize,
+    elapsed_ms: u64,
+    eta_ms: Option<u64>,
+}
+
+enum SizeScanEvent {
+    Progress {
+        request_id: u64,
+        progress: SizeScanProgress,
+    },
+    Finished {
+        request_id: u64,
+        result: Result<SizeScanResult, String>,
+    },
 }
 
 const SIZE_SCAN_CANCELLED: &str = "__SIZE_SCAN_CANCELLED__";
@@ -336,6 +374,12 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
         .build();
     size_detail_group.add(&size_summary_row);
 
+    let size_targets_row = adw::ActionRow::builder()
+        .title(pick(lang, "统计目标", "Targets"))
+        .subtitle("-")
+        .build();
+    size_detail_group.add(&size_targets_row);
+
     let mode_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     mode_row.set_margin_start(6);
     mode_row.set_margin_end(6);
@@ -477,6 +521,7 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
         let di = detail_id.clone();
         let uninstall_copy_btn = uninstall_copy_btn.clone();
         let size_summary_row = size_summary_row.clone();
+        let size_targets_row = size_targets_row.clone();
         let size_detail_list = size_detail_list.clone();
         let size_refresh_btn = size_refresh_btn.clone();
         let size_cancel_btn = size_cancel_btn.clone();
@@ -489,13 +534,16 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
         let selected_pkg = Rc::new(RefCell::new(None::<SelectedPackage>));
         let uninstall_command_target = Rc::new(RefCell::new(None::<String>));
         let size_request_id = Rc::new(Cell::new(0_u64));
+        let size_scan_token = Rc::new(RefCell::new(None::<CancellationToken>));
         let version_request_id = Rc::new(Cell::new(0_u64));
+        let page_token = token.clone();
 
         let run_size_scan: Rc<dyn Fn()> = Rc::new({
             let selected_pkg = selected_pkg.clone();
             let dsz = dsz.clone();
             let ds = ds.clone();
             let size_summary_row = size_summary_row.clone();
+            let size_targets_row = size_targets_row.clone();
             let size_detail_list = size_detail_list.clone();
             let size_refresh_btn = size_refresh_btn.clone();
             let size_cancel_btn = size_cancel_btn.clone();
@@ -504,14 +552,25 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
             let size_entries_state = size_entries_state.clone();
             let size_total_state = size_total_state.clone();
             let size_request_id = size_request_id.clone();
+            let size_scan_token = size_scan_token.clone();
+            let page_token = page_token.clone();
             move || {
                 let Some(pkg) = selected_pkg.borrow().clone() else {
                     dsz.set_subtitle("-");
                     return;
                 };
 
+                if let Some(token) = size_scan_token.borrow_mut().take() {
+                    token.cancel();
+                }
+
+                let scan_token = page_token.child_token();
+                *size_scan_token.borrow_mut() = Some(scan_token.clone());
+
                 clear_list_box(&size_detail_list);
                 size_summary_row.set_subtitle(pick(lang, "计算中...", "Calculating..."));
+                size_targets_row.set_subtitle(pick(lang, "准备统计目标...", "Preparing targets..."));
+                size_targets_row.set_tooltip_text(None);
                 dsz.set_subtitle(pick(lang, "计算中，请稍候...", "Calculating..."));
                 dsz.set_sensitive(false);
                 size_refresh_btn.set_sensitive(false);
@@ -521,15 +580,20 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
                 let request_id = size_request_id.get().saturating_add(1);
                 size_request_id.set(request_id);
 
-                let (tx, rx) = async_channel::bounded::<(u64, Result<SizeScanResult, String>)>(1);
+                let (tx, rx) = async_channel::bounded::<SizeScanEvent>(64);
                 runtime::spawn(async move {
-                    let result = calculate_package_size_details(&pkg).await;
-                    let _ = tx.send((request_id, result)).await;
+                    let result =
+                        calculate_package_size_details(&pkg, scan_token, tx.clone(), request_id)
+                            .await;
+                    let _ = tx
+                        .send(SizeScanEvent::Finished { request_id, result })
+                        .await;
                 });
 
                 let dsz = dsz.clone();
                 let ds = ds.clone();
                 let size_summary_row = size_summary_row.clone();
+                let size_targets_row = size_targets_row.clone();
                 let size_detail_list = size_detail_list.clone();
                 let size_refresh_btn = size_refresh_btn.clone();
                 let size_cancel_btn = size_cancel_btn.clone();
@@ -538,61 +602,175 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
                 let size_total_state = size_total_state.clone();
                 let entry_view_state = entry_view_state.clone();
                 let size_request_id = size_request_id.clone();
+                let size_scan_token = size_scan_token.clone();
                 glib::spawn_future_local(async move {
-                    if let Ok((done_request_id, result)) = rx.recv().await {
-                        if done_request_id != size_request_id.get() {
-                            return;
-                        }
-
-                        match result {
-                            Ok(scan) => {
-                                if scan.entries.is_empty() {
-                                    size_summary_row.set_subtitle(pick(
-                                        lang,
-                                        "未找到可统计文件",
-                                        "No measurable files",
-                                    ));
-                                    dsz.set_subtitle(pick(
-                                        lang,
-                                        "未找到可统计文件（可重试）",
-                                        "No measurable files",
-                                    ));
-                                } else {
-                                    let summary = format_size(scan.total_size);
-                                    size_summary_row.set_subtitle(&summary);
-                                    dsz.set_subtitle(&summary);
-
-                                    size_total_state.set(scan.total_size);
-                                    *size_entries_state.borrow_mut() = scan.entries.clone();
-
-                                    render_size_entries_incremental(
-                                        size_detail_list.clone(),
-                                        scan.entries,
-                                        scan.total_size,
-                                        percent_mode_state.get(),
-                                        entry_view_state.get(),
-                                        lang,
-                                    );
+                    while let Ok(event) = rx.recv().await {
+                        match event {
+                            SizeScanEvent::Progress {
+                                request_id: done_request_id,
+                                progress,
+                            } => {
+                                if done_request_id != size_request_id.get() {
+                                    continue;
                                 }
+
+                                let text = format_size_scan_progress(&progress, lang);
+                                let safe = glib::markup_escape_text(&text);
+                                size_summary_row.set_subtitle(&safe);
+                                dsz.set_subtitle(&safe);
                             }
-                            Err(err) if err == SIZE_SCAN_CANCELLED => {
-                                size_summary_row.set_subtitle(pick(lang, "已取消", "Cancelled"));
-                                dsz.set_subtitle(pick(lang, "统计已取消", "Scan cancelled"));
-                            }
-                            Err(_) => {
-                                size_summary_row.set_subtitle(pick(lang, "统计失败", "Failed"));
-                                dsz.set_subtitle(pick(
-                                    lang,
-                                    "统计失败（可重试）",
-                                    "Failed (retry)",
-                                ));
+                            SizeScanEvent::Finished {
+                                request_id: done_request_id,
+                                result,
+                            } => {
+                                if done_request_id != size_request_id.get() {
+                                    return;
+                                }
+
+                                let _ = size_scan_token.borrow_mut().take();
+
+                                match result {
+                                    Ok(scan) => {
+                                        if scan.targets.is_empty() {
+                                            size_targets_row.set_subtitle("-");
+                                            size_targets_row.set_tooltip_text(None);
+                                        } else {
+                                            let subtitle = match lang {
+                                                Language::ZhCn => {
+                                                    format!("{} 个路径（悬停查看）", scan.targets.len())
+                                                }
+                                                Language::En => format!(
+                                                    "{} path(s) (hover to view)",
+                                                    scan.targets.len()
+                                                ),
+                                            };
+                                            size_targets_row
+                                                .set_subtitle(&glib::markup_escape_text(&subtitle));
+                                            let tip = scan
+                                                .targets
+                                                .iter()
+                                                .map(|t| {
+                                                    if t.recursive {
+                                                        format!("[R] {}", t.path)
+                                                    } else {
+                                                        format!("[F] {}", t.path)
+                                                    }
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join("\n");
+                                            size_targets_row.set_tooltip_text(Some(&tip));
+                                        }
+
+                                        if scan.entries.is_empty() {
+                                            if scan.permission_denied {
+                                                size_summary_row.set_subtitle(pick(
+                                                    lang,
+                                                    "无权限读取统计目标",
+                                                    "Permission denied",
+                                                ));
+                                                dsz.set_subtitle(pick(
+                                                    lang,
+                                                    "无权限读取统计目标（可调整权限后重试）",
+                                                    "Permission denied (adjust permissions and retry)",
+                                                ));
+                                            } else {
+                                                size_summary_row.set_subtitle(pick(
+                                                    lang,
+                                                    "未找到可统计文件",
+                                                    "No measurable files",
+                                                ));
+                                                dsz.set_subtitle(pick(
+                                                    lang,
+                                                    "未找到可统计文件（可重试）",
+                                                    "No measurable files",
+                                                ));
+                                            }
+                                        } else {
+                                            let summary = format_size(scan.total_size);
+                                            let summary_text = if scan.truncated
+                                                || scan.permission_denied
+                                            {
+                                                match lang {
+                                                    Language::ZhCn => {
+                                                        let mut reasons = Vec::new();
+                                                        if scan.truncated {
+                                                            reasons.push("文件过多");
+                                                        }
+                                                        if scan.permission_denied {
+                                                            reasons.push("权限不足");
+                                                        }
+                                                        format!(
+                                                            "{summary}（可能不完整：{}）",
+                                                            reasons.join("、")
+                                                        )
+                                                    }
+                                                    Language::En => {
+                                                        let mut reasons = Vec::new();
+                                                        if scan.truncated {
+                                                            reasons.push("too many files");
+                                                        }
+                                                        if scan.permission_denied {
+                                                            reasons.push("permission denied");
+                                                        }
+                                                        format!(
+                                                            "{summary} (may be incomplete: {})",
+                                                            reasons.join(", ")
+                                                        )
+                                                    }
+                                                }
+                                            } else {
+                                                summary
+                                            };
+                                            size_summary_row.set_subtitle(&summary_text);
+                                            dsz.set_subtitle(&summary_text);
+
+                                            size_total_state.set(scan.total_size);
+                                            *size_entries_state.borrow_mut() = scan.entries.clone();
+
+                                            render_size_entries_incremental(
+                                                size_detail_list.clone(),
+                                                scan.entries,
+                                                scan.total_size,
+                                                percent_mode_state.get(),
+                                                entry_view_state.get(),
+                                                lang,
+                                            );
+                                        }
+                                    }
+                                    Err(err) if err == SIZE_SCAN_CANCELLED => {
+                                        size_summary_row.set_subtitle(pick(
+                                            lang,
+                                            "已取消",
+                                            "Cancelled",
+                                        ));
+                                        dsz.set_subtitle(pick(
+                                            lang,
+                                            "统计已取消",
+                                            "Scan cancelled",
+                                        ));
+                                        size_targets_row.set_subtitle("-");
+                                        size_targets_row.set_tooltip_text(None);
+                                    }
+                                    Err(_) => {
+                                        size_summary_row
+                                            .set_subtitle(pick(lang, "统计失败", "Failed"));
+                                        dsz.set_subtitle(pick(
+                                            lang,
+                                            "统计失败（可重试）",
+                                            "Failed (retry)",
+                                        ));
+                                        size_targets_row.set_subtitle("-");
+                                        size_targets_row.set_tooltip_text(None);
+                                    }
+                                }
+
+                                dsz.set_sensitive(true);
+                                size_refresh_btn.set_sensitive(true);
+                                size_cancel_btn.set_sensitive(false);
+                                ds.set_visible_child_name("size-detail");
+                                break;
                             }
                         }
-
-                        dsz.set_sensitive(true);
-                        size_refresh_btn.set_sensitive(true);
-                        size_cancel_btn.set_sensitive(false);
-                        ds.set_visible_child_name("size-detail");
                     }
                 });
             }
@@ -668,14 +846,21 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
 
         size_cancel_btn.connect_clicked({
             let size_request_id = size_request_id.clone();
+            let size_scan_token = size_scan_token.clone();
             let size_summary_row = size_summary_row.clone();
+            let size_targets_row = size_targets_row.clone();
             let dsz = dsz.clone();
             let size_cancel_btn = size_cancel_btn.clone();
             let size_refresh_btn = size_refresh_btn.clone();
             move |_| {
+                if let Some(token) = size_scan_token.borrow_mut().take() {
+                    token.cancel();
+                }
                 size_request_id.set(size_request_id.get().saturating_add(1));
                 size_summary_row.set_subtitle(pick(lang, "已取消", "Cancelled"));
                 dsz.set_subtitle(pick(lang, "统计已取消", "Scan cancelled"));
+                size_targets_row.set_subtitle("-");
+                size_targets_row.set_tooltip_text(None);
                 dsz.set_sensitive(true);
                 size_cancel_btn.set_sensitive(false);
                 size_refresh_btn.set_sensitive(true);
@@ -727,6 +912,10 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
         detail_path.add_controller(path_click);
 
         selection.connect_selection_changed(move |sel, _, _| {
+            if let Some(token) = size_scan_token.borrow_mut().take() {
+                token.cancel();
+            }
+
             let item = sel.selected_item();
             match item.and_downcast::<glib::BoxedAnyObject>() {
                 Some(obj) => {
@@ -734,8 +923,10 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
                     let selected = SelectedPackage {
                         canonical_id: pkg.canonical_id.clone(),
                         source: pkg.source.clone(),
+                        install_method: pkg.install_method.clone(),
                         install_path: pkg.install_path.clone(),
                         desktop_file: pkg.desktop_file.clone(),
+                        uninstall_command: pkg.uninstall_command.clone(),
                     };
                     *selected_pkg.borrow_mut() = Some(selected.clone());
                     size_request_id.set(size_request_id.get().saturating_add(1));
@@ -787,6 +978,8 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
                     size_total_state.set(0);
                     size_entries_state.borrow_mut().clear();
                     size_summary_row.set_subtitle("-");
+                    size_targets_row.set_subtitle("-");
+                    size_targets_row.set_tooltip_text(None);
                     clear_list_box(&size_detail_list);
                     dpath.set_subtitle(&glib::markup_escape_text(
                         pkg.install_path.as_deref().unwrap_or("-"),
@@ -828,6 +1021,8 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
                     size_total_state.set(0);
                     size_entries_state.borrow_mut().clear();
                     size_summary_row.set_subtitle("-");
+                    size_targets_row.set_subtitle("-");
+                    size_targets_row.set_tooltip_text(None);
                     clear_list_box(&size_detail_list);
                     *open_path_target.borrow_mut() = None;
                     duninstall.set_subtitle("-");
@@ -965,6 +1160,76 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+fn format_duration_ms(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    let secs = total_secs % 60;
+    let mins = (total_secs / 60) % 60;
+    let hours = total_secs / 3600;
+    if hours > 0 {
+        format!("{hours}:{mins:02}:{secs:02}")
+    } else {
+        format!("{mins}:{secs:02}")
+    }
+}
+
+fn format_size_scan_progress(progress: &SizeScanProgress, lang: Language) -> String {
+    let elapsed = format_duration_ms(progress.elapsed_ms);
+    let eta = progress
+        .eta_ms
+        .filter(|v| *v > 0)
+        .map(format_duration_ms);
+
+    match progress.phase {
+        SizeScanPhase::PreparingTargets => match lang {
+            Language::ZhCn => format!("准备统计目标... · 已耗时 {elapsed}"),
+            Language::En => format!("Preparing targets... · Elapsed {elapsed}"),
+        },
+        SizeScanPhase::ScanningTargets => {
+            let count = if progress.targets_total > 0 {
+                format!("{}/{}", progress.targets_done, progress.targets_total)
+            } else {
+                "-".to_string()
+            };
+
+            let current_part = progress
+                .current_path
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .map(|v| match lang {
+                    Language::ZhCn => format!(" · 当前 {v}"),
+                    Language::En => format!(" · Current {v}"),
+                })
+                .unwrap_or_default();
+
+            let files_part = if progress.scanned_files > 0 {
+                match lang {
+                    Language::ZhCn => format!(" · 已扫描 {} 文件", progress.scanned_files),
+                    Language::En => format!(" · {} files", progress.scanned_files),
+                }
+            } else {
+                String::new()
+            };
+
+            let eta_part = eta
+                .as_deref()
+                .map(|v| match lang {
+                    Language::ZhCn => format!(" · 预计剩余 {v}"),
+                    Language::En => format!(" · ETA {v}"),
+                })
+                .unwrap_or_default();
+
+            match lang {
+                Language::ZhCn => {
+                    format!("已完成 {count}{current_part}{files_part} · 已耗时 {elapsed}{eta_part}")
+                }
+                Language::En => {
+                    format!("Done {count}{current_part}{files_part} · Elapsed {elapsed}{eta_part}")
+                }
+            }
+        }
+    }
+}
+
 fn is_system_package(pkg: &Package) -> bool {
     pkg.install_method == "apt" && pkg.desktop_file.is_none()
 }
@@ -987,33 +1252,138 @@ fn copy_text_to_clipboard(text: &str) -> bool {
     true
 }
 
-async fn calculate_package_size_details(pkg: &SelectedPackage) -> Result<SizeScanResult, String> {
-    let targets = collect_candidate_paths(pkg).await;
+async fn calculate_package_size_details(
+    pkg: &SelectedPackage,
+    token: CancellationToken,
+    progress_tx: async_channel::Sender<SizeScanEvent>,
+    request_id: u64,
+) -> Result<SizeScanResult, String> {
+    let started = Instant::now();
+
+    let _ = progress_tx.try_send(SizeScanEvent::Progress {
+        request_id,
+        progress: SizeScanProgress {
+            phase: SizeScanPhase::PreparingTargets,
+            current_path: None,
+            targets_done: 0,
+            targets_total: 0,
+            scanned_files: 0,
+            elapsed_ms: 0,
+            eta_ms: None,
+        },
+    });
+
+    let targets = token
+        .run_until_cancelled(collect_candidate_paths(pkg))
+        .await
+        .ok_or_else(|| SIZE_SCAN_CANCELLED.to_string())?;
     if targets.is_empty() {
         return Ok(SizeScanResult {
             total_size: 0,
             entries: Vec::new(),
+            targets: Vec::new(),
+            truncated: false,
+            permission_denied: false,
         });
     }
 
-    let mut all_files: HashMap<String, FileRecord> = HashMap::new();
-    let mut dir_seen_files: HashMap<String, HashSet<String>> = HashMap::new();
     let mut visited = BTreeSet::<String>::new();
-
+    let mut effective_targets = Vec::<SizePathCandidate>::new();
     for target in targets {
         let key = normalize_path_key(&target.path);
-        if !visited.insert(key) {
-            continue;
+        if visited.insert(key) {
+            effective_targets.push(target);
         }
+    }
+
+    if effective_targets.is_empty() {
+        return Ok(SizeScanResult {
+            total_size: 0,
+            entries: Vec::new(),
+            targets: Vec::new(),
+            truncated: false,
+            permission_denied: false,
+        });
+    }
+
+    let targets_total = effective_targets.len();
+    let mut all_files: HashMap<String, FileRecord> = HashMap::new();
+    let mut dir_seen_files: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut truncated = false;
+    let mut permission_denied = false;
+    let mut completed_target_ms_total = 0_u64;
+    let mut completed_target_count = 0_u32;
+
+    for (idx, target) in effective_targets.iter().cloned().enumerate() {
+        if token.is_cancelled() {
+            return Err(SIZE_SCAN_CANCELLED.to_string());
+        }
+
+        let avg_ms = if completed_target_count == 0 {
+            None
+        } else {
+            Some(completed_target_ms_total / u64::from(completed_target_count))
+        };
+        let eta_ms = avg_ms.map(|avg| {
+            avg.saturating_mul(
+                u64::try_from(targets_total.saturating_sub(idx)).unwrap_or(u64::MAX),
+            )
+        });
+
+        let _ = progress_tx.try_send(SizeScanEvent::Progress {
+            request_id,
+            progress: SizeScanProgress {
+                phase: SizeScanPhase::ScanningTargets,
+                current_path: Some(target.path.clone()),
+                targets_done: idx,
+                targets_total,
+                scanned_files: 0,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                eta_ms,
+            },
+        });
 
         let path = target.path;
         let recursive = target.recursive;
 
-        let files = tokio::task::spawn_blocking(move || collect_target_files(&path, recursive))
-            .await
-            .map_err(|e| format!("scan worker failed: {e}"))?;
+        let scan_started = Instant::now();
+        let token_for_worker = token.clone();
+        let tx_for_progress = progress_tx.clone();
+        let request_id_for_progress = request_id;
+        let started_for_progress = started;
+        let idx_for_progress = idx;
+        let targets_total_for_progress = targets_total;
+        let avg_ms_for_progress = avg_ms;
+        let scanned = tokio::task::spawn_blocking(move || {
+            collect_target_files(&path, recursive, &token_for_worker, |file_count| {
+                let eta_ms = avg_ms_for_progress.map(|avg| {
+                    avg.saturating_mul(u64::try_from(
+                        targets_total_for_progress.saturating_sub(idx_for_progress),
+                    )
+                    .unwrap_or(u64::MAX))
+                });
 
-        for (file_path, record) in files {
+                let _ = tx_for_progress.try_send(SizeScanEvent::Progress {
+                    request_id: request_id_for_progress,
+                    progress: SizeScanProgress {
+                        phase: SizeScanPhase::ScanningTargets,
+                        current_path: Some(path.clone()),
+                        targets_done: idx_for_progress,
+                        targets_total: targets_total_for_progress,
+                        scanned_files: file_count,
+                        elapsed_ms: started_for_progress.elapsed().as_millis() as u64,
+                        eta_ms,
+                    },
+                });
+            })
+        })
+        .await
+        .map_err(|e| format!("scan worker failed: {e}"))??;
+
+        truncated = truncated || scanned.truncated;
+        permission_denied = permission_denied || scanned.permission_denied;
+
+        for (file_path, record) in scanned.files {
             all_files
                 .entry(file_path.clone())
                 .and_modify(|existing| {
@@ -1026,6 +1396,27 @@ async fn calculate_package_size_details(pkg: &SelectedPackage) -> Result<SizeSca
             let parent = parent_dir_of(&file_path).unwrap_or_else(|| "/".to_string());
             dir_seen_files.entry(parent).or_default().insert(file_path);
         }
+
+        completed_target_ms_total =
+            completed_target_ms_total.saturating_add(scan_started.elapsed().as_millis() as u64);
+        completed_target_count = completed_target_count.saturating_add(1);
+
+        let avg_ms = Some(completed_target_ms_total / u64::from(completed_target_count));
+        let remaining = targets_total.saturating_sub(idx.saturating_add(1));
+        let eta_ms = avg_ms.map(|avg| avg.saturating_mul(u64::try_from(remaining).unwrap_or(0)));
+
+        let _ = progress_tx.try_send(SizeScanEvent::Progress {
+            request_id,
+            progress: SizeScanProgress {
+                phase: SizeScanPhase::ScanningTargets,
+                current_path: None,
+                targets_done: idx.saturating_add(1),
+                targets_total,
+                scanned_files: 0,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                eta_ms,
+            },
+        });
     }
 
     let mut entries = Vec::<SizeEntry>::new();
@@ -1057,11 +1448,17 @@ async fn calculate_package_size_details(pkg: &SelectedPackage) -> Result<SizeSca
 
     entries.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
 
-    let mut unique_files = BTreeSet::new();
+    let mut unique_inodes = HashSet::<(u64, u64)>::new();
+    let mut unique_paths = HashSet::<String>::new();
     let mut total_size = 0_u64;
-    for record in all_files.values() {
-        let key = format!("{}:{}", record.dev, record.ino);
-        if unique_files.insert(key) {
+    for (path, record) in &all_files {
+        if record.dev != 0 && record.ino != 0 {
+            if unique_inodes.insert((record.dev, record.ino)) {
+                total_size = total_size.saturating_add(record.size);
+            }
+            continue;
+        }
+        if unique_paths.insert(path.clone()) {
             total_size = total_size.saturating_add(record.size);
         }
     }
@@ -1069,6 +1466,9 @@ async fn calculate_package_size_details(pkg: &SelectedPackage) -> Result<SizeSca
     Ok(SizeScanResult {
         total_size,
         entries,
+        targets: effective_targets,
+        truncated,
+        permission_denied,
     })
 }
 
@@ -1151,37 +1551,100 @@ fn render_size_entries_incremental(
     });
 }
 
-fn collect_target_files(path: &str, recursive: bool) -> HashMap<String, FileRecord> {
+struct TargetFiles {
+    files: HashMap<String, FileRecord>,
+    truncated: bool,
+    permission_denied: bool,
+}
+
+fn collect_target_files(
+    path: &str,
+    recursive: bool,
+    token: &CancellationToken,
+    mut on_progress: impl FnMut(usize),
+) -> Result<TargetFiles, String> {
     const MAX_FILES_PER_TARGET: usize = 200_000;
 
+    if token.is_cancelled() {
+        return Err(SIZE_SCAN_CANCELLED.to_string());
+    }
+
     let mut files = HashMap::new();
+    let mut truncated = false;
+    let mut permission_denied = false;
+    let mut last_emit = Instant::now();
+    on_progress(0);
     let p = Path::new(path);
-    let Ok(meta) = std::fs::metadata(p) else {
-        return files;
+    let meta = match std::fs::metadata(p) {
+        Ok(m) => m,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                permission_denied = true;
+            }
+            on_progress(0);
+            return Ok(TargetFiles {
+                files,
+                truncated,
+                permission_denied,
+            });
+        }
     };
 
     if meta.is_file() {
         if let Some(record) = metadata_to_record(&meta) {
             files.insert(path.to_string(), record);
         }
-        return files;
+        on_progress(files.len());
+        return Ok(TargetFiles {
+            files,
+            truncated,
+            permission_denied,
+        });
     }
 
     if !meta.is_dir() || !recursive {
-        return files;
+        on_progress(files.len());
+        return Ok(TargetFiles {
+            files,
+            truncated,
+            permission_denied,
+        });
     }
 
-    for entry in walkdir::WalkDir::new(p)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
+    for entry in walkdir::WalkDir::new(p).follow_links(false).into_iter() {
+        if token.is_cancelled() {
+            return Err(SIZE_SCAN_CANCELLED.to_string());
+        }
+
+        let entry = match entry {
+            Ok(v) => v,
+            Err(err) => {
+                if err
+                    .io_error()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+                {
+                    permission_denied = true;
+                }
+                continue;
+            }
+        };
+
         if files.len() >= MAX_FILES_PER_TARGET {
+            truncated = true;
             break;
         }
 
-        let Ok(file_meta) = entry.metadata() else {
-            continue;
+        let file_meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(err) => {
+                if err
+                    .io_error()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+                {
+                    permission_denied = true;
+                }
+                continue;
+            }
         };
         if !file_meta.is_file() {
             continue;
@@ -1198,18 +1661,30 @@ fn collect_target_files(path: &str, recursive: bool) -> HashMap<String, FileReco
                 })
                 .or_insert(record);
         }
+
+        if last_emit.elapsed() >= Duration::from_millis(450) {
+            on_progress(files.len());
+            last_emit = Instant::now();
+        }
     }
 
-    files
+    on_progress(files.len());
+    Ok(TargetFiles {
+        files,
+        truncated,
+        permission_denied,
+    })
 }
 
 fn metadata_to_record(meta: &std::fs::Metadata) -> Option<FileRecord> {
     #[cfg(unix)]
     {
+        let allocated = meta.blocks().saturating_mul(512);
+        let size = if allocated > 0 { allocated } else { meta.len() };
         Some(FileRecord {
             dev: meta.dev(),
             ino: meta.ino(),
-            size: meta.len(),
+            size,
         })
     }
 
@@ -1233,29 +1708,460 @@ fn parent_dir_of(path: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-async fn collect_candidate_paths(pkg: &SelectedPackage) -> Vec<SizePathCandidate> {
-    if pkg.source == "apt" {
-        let (_, name) = parse_canonical_id(&pkg.canonical_id);
-        return collect_dpkg_package_paths(name).await;
+fn normalize_loose_key(text: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in text.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn xdg_dir(env_key: &str, fallback_suffix: &str) -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var(env_key) {
+        let trimmed = raw.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+
+    let Ok(home) = std::env::var("HOME") else {
+        return None;
+    };
+    let home = home.trim().trim_end_matches('/');
+    if home.is_empty() {
+        return None;
+    }
+    Some(Path::new(home).join(fallback_suffix))
+}
+
+fn is_dot_dir_key_too_generic(key: &str) -> bool {
+    let k = normalize_loose_key(key);
+    matches!(
+        k.as_str(),
+        "cache" | "config" | "local" | "share" | "state" | "tmp" | "temp" | "downloads" | "desktop"
+    )
+}
+
+fn find_matching_child_dirs(base: &Path, key: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if key.trim().is_empty() {
+        return out;
+    }
+
+    let direct = base.join(key);
+    if direct.is_dir() {
+        out.push(direct);
+    }
+
+    let base_iter = match std::fs::read_dir(base) {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+
+    let want = normalize_loose_key(key);
+    if want.is_empty() {
+        return out;
+    }
+
+    for entry in base_iter.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if normalize_loose_key(&name) != want {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+
+        let path = entry.path();
+        if !out.iter().any(|p| p == &path) {
+            out.push(path);
+        }
+    }
+
+    out
+}
+
+fn app_key_candidates(pkg: &SelectedPackage) -> Vec<String> {
+    let mut keys = BTreeSet::<String>::new();
+
+    if let Some(name) = canonical_name(&pkg.canonical_id) {
+        keys.insert(name);
+    }
+
+    if let Some(desktop_file) = pkg.desktop_file.as_deref() {
+        if let Some(stem) = Path::new(desktop_file)
+            .file_stem()
+            .and_then(|v| v.to_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            keys.insert(stem.to_string());
+        }
     }
 
     if let Some(path) = pkg.install_path.as_deref() {
-        if let Some(owner_pkg) = resolve_dpkg_owner_from_path(path).await {
-            let mut targets = collect_dpkg_package_paths(&owner_pkg).await;
-            if !targets.is_empty() {
-                if let Some(desktop_file) = pkg.desktop_file.as_deref() {
+        let p = Path::new(path);
+        if let Some(name) = p
+            .file_name()
+            .and_then(|v| v.to_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            keys.insert(name.to_string());
+        }
+        if let Some(stem) = p
+            .file_stem()
+            .and_then(|v| v.to_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            keys.insert(stem.to_string());
+        }
+    }
+
+    keys.into_iter().collect()
+}
+
+fn collect_user_data_targets(pkg: &SelectedPackage) -> Vec<SizePathCandidate> {
+    let keys = app_key_candidates(pkg);
+    if keys.is_empty() {
+        return Vec::new();
+    }
+
+    let config_home = xdg_dir("XDG_CONFIG_HOME", ".config");
+    let data_home = xdg_dir("XDG_DATA_HOME", ".local/share");
+    let cache_home = xdg_dir("XDG_CACHE_HOME", ".cache");
+    let state_home = xdg_dir("XDG_STATE_HOME", ".local/state");
+
+    let mut found = BTreeSet::<String>::new();
+    let mut targets = Vec::<SizePathCandidate>::new();
+
+    for key in &keys {
+        for base in [
+            config_home.as_deref(),
+            data_home.as_deref(),
+            cache_home.as_deref(),
+            state_home.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for dir in find_matching_child_dirs(base, key) {
+                let path = dir.to_string_lossy().trim_end_matches('/').to_string();
+                if path.starts_with('/') && found.insert(path.clone()) {
                     targets.push(SizePathCandidate {
-                        path: desktop_file.to_string(),
-                        recursive: false,
+                        path,
+                        recursive: true,
                     });
                 }
-                return targets;
             }
         }
     }
 
+    if let Ok(home) = std::env::var("HOME") {
+        let home = home.trim().trim_end_matches('/');
+        if !home.is_empty() {
+            let home_p = Path::new(home);
+            for key in &keys {
+                if is_dot_dir_key_too_generic(key) {
+                    continue;
+                }
+                let dot = format!(".{key}");
+                for dir in find_matching_child_dirs(home_p, &dot) {
+                    let path = dir.to_string_lossy().trim_end_matches('/').to_string();
+                    if path.starts_with('/') && found.insert(path.clone()) {
+                        targets.push(SizePathCandidate {
+                            path,
+                            recursive: true,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    targets
+}
+
+fn collect_var_data_targets(pkg: &SelectedPackage) -> Vec<SizePathCandidate> {
+    if pkg.source != "apt" && pkg.source != "desktop" {
+        return Vec::new();
+    }
+
+    let keys = app_key_candidates(pkg);
+    if keys.is_empty() {
+        return Vec::new();
+    }
+
+    let bases = ["/var/lib", "/var/cache", "/var/log"];
+    let mut found = BTreeSet::<String>::new();
+    let mut targets = Vec::<SizePathCandidate>::new();
+
+    for base in bases {
+        let base_p = Path::new(base);
+        for key in &keys {
+            for dir in find_matching_child_dirs(base_p, key) {
+                let path = dir.to_string_lossy().trim_end_matches('/').to_string();
+                if path.starts_with('/') && found.insert(path.clone()) {
+                    targets.push(SizePathCandidate {
+                        path,
+                        recursive: true,
+                    });
+                }
+            }
+        }
+    }
+
+    targets
+}
+
+fn desktop_workdir_from_file(desktop_file: &str) -> Option<String> {
+    let path = Path::new(desktop_file);
+    let de = DesktopEntry::from_path(path, None::<&[&str]>).ok()?;
+    let raw = de.path()?.trim();
+    if !raw.starts_with('/') {
+        return None;
+    }
+    let normalized = raw.trim_end_matches('/');
+    if normalized.is_empty() {
+        return None;
+    }
+    let p = Path::new(normalized);
+    if !p.exists() || !p.is_dir() {
+        return None;
+    }
+
+    // 避免把整个主目录当作“安装路径”去递归统计，风险太大且容易误触。
+    if let Ok(home) = std::env::var("HOME") {
+        let home = home.trim_end_matches('/');
+        if !home.is_empty() && normalized == home {
+            return None;
+        }
+    }
+
+    if normalized == "/" || normalized == "/usr" {
+        return None;
+    }
+
+    Some(normalized.to_string())
+}
+
+fn extract_env_assignment(exec_raw: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    exec_raw
+        .split_whitespace()
+        .map(|token| token.trim_matches('"').trim_matches('\''))
+        .find_map(|token| token.strip_prefix(&prefix).map(ToString::to_string))
+        .map(|v| v.trim_matches('"').trim_matches('\'').to_string())
+}
+
+fn wine_prefix_from_desktop_file(desktop_file: &str) -> Option<String> {
+    let path = Path::new(desktop_file);
+    let de = DesktopEntry::from_path(path, None::<&[&str]>).ok()?;
+    let exec_raw = de.exec().unwrap_or_default();
+    let prefix = extract_env_assignment(exec_raw, "WINEPREFIX")?;
+    if !prefix.starts_with('/') {
+        return None;
+    }
+    let normalized = prefix.trim_end_matches('/').to_string();
+    let p = Path::new(&normalized);
+    if p.exists() && p.is_dir() {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+fn wine_prefix_from_pkg(pkg: &SelectedPackage) -> Option<String> {
+    if let Some(desktop_file) = pkg.desktop_file.as_deref() {
+        if let Some(prefix) = wine_prefix_from_desktop_file(desktop_file) {
+            return Some(prefix);
+        }
+    }
+
+    if let Some(cmd) = pkg.uninstall_command.as_deref() {
+        if let Some(prefix) = extract_env_assignment(cmd, "WINEPREFIX") {
+            if prefix.starts_with('/') {
+                let normalized = prefix.trim_end_matches('/').to_string();
+                let p = Path::new(&normalized);
+                if p.exists() && p.is_dir() {
+                    return Some(normalized);
+                }
+            }
+        }
+    }
+
+    let Ok(home) = std::env::var("HOME") else {
+        return None;
+    };
+    let candidate = format!("{}/.wine", home.trim_end_matches('/'));
+    let p = Path::new(&candidate);
+    if p.exists() && p.is_dir() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn conda_root_from_install_path(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+
+    let markers = ["anaconda3", "miniconda3", "mambaforge", "miniforge3"];
+    let mut root: Option<String> = None;
+    for marker in markers {
+        let needle = format!("/{marker}/");
+        if let Some(pos) = path.find(&needle) {
+            root = Some(format!("{}{}", &path[..pos], format!("/{marker}")));
+            break;
+        }
+        let suffix = format!("/{marker}");
+        if path.ends_with(&suffix) {
+            root = Some(path.to_string());
+            break;
+        }
+    }
+
+    let mut root = root?;
+
+    // 若命中 envs/<name>，优先统计该环境目录，而不是整个 base。
+    if let Some(envs_pos) = path.find("/envs/") {
+        if envs_pos > 0 {
+            let envs_rest = &path[envs_pos + "/envs/".len()..];
+            let env_name = envs_rest.split('/').next().unwrap_or("").trim();
+            if !env_name.is_empty() {
+                root = format!("{root}/envs/{env_name}");
+            }
+        }
+    }
+
+    let normalized = root.trim_end_matches('/').to_string();
+    let p = Path::new(&normalized);
+    if !p.exists() || !p.is_dir() {
+        return None;
+    }
+
+    // 避免误把整个主目录当作 conda 根目录。
+    if let Ok(home) = std::env::var("HOME") {
+        let home = home.trim_end_matches('/');
+        if !home.is_empty() && normalized == home {
+            return None;
+        }
+    }
+
+    Some(normalized)
+}
+
+fn bundle_root_from_install_path(path: &str) -> Option<String> {
+    let p = Path::new(path);
+    if !path.starts_with('/') {
+        return None;
+    }
+
+    let mut current = p.parent()?;
+    while let Some(parent) = current.parent() {
+        let Some(name) = current.file_name().and_then(|v| v.to_str()) else {
+            current = parent;
+            continue;
+        };
+        if name != "bin" {
+            current = parent;
+            continue;
+        }
+
+        let root = parent;
+        let root_str = root.to_string_lossy().trim_end_matches('/').to_string();
+        if root_str.is_empty() || root_str == "/" || root_str == "/usr" {
+            return None;
+        }
+
+        if let Ok(home) = std::env::var("HOME") {
+            let home = home.trim_end_matches('/');
+            if !home.is_empty() && root_str == home {
+                return None;
+            }
+        }
+
+        if !root.exists() || !root.is_dir() {
+            return None;
+        }
+
+        let has_hint = root.join("lib").is_dir()
+            || root.join("lib64").is_dir()
+            || root.join("share").is_dir()
+            || root.join("resources").is_dir()
+            || root.join("conda-meta").exists();
+        if has_hint {
+            return Some(root_str);
+        }
+        return None;
+    }
+
+    None
+}
+
+async fn collect_candidate_paths(pkg: &SelectedPackage) -> Vec<SizePathCandidate> {
+    let desktop_targets = |targets: &mut Vec<SizePathCandidate>| {
+        let Some(desktop_file) = pkg.desktop_file.as_deref() else {
+            return;
+        };
+
+        if let Some(workdir) = desktop_workdir_from_file(desktop_file) {
+            targets.push(SizePathCandidate {
+                path: workdir,
+                recursive: true,
+            });
+        }
+
+        targets.push(SizePathCandidate {
+            path: desktop_file.to_string(),
+            recursive: false,
+        });
+    };
+
+    // 1) 优先使用 dpkg 精准枚举（仅在可用时）。
+    if pkg.source == "apt" && command_exists("dpkg-query") {
+        let (_, name) = parse_canonical_id(&pkg.canonical_id);
+        let mut targets = collect_dpkg_package_paths(name).await;
+        if !targets.is_empty() {
+            targets.extend(collect_var_data_targets(pkg));
+            targets.extend(collect_user_data_targets(pkg));
+            desktop_targets(&mut targets);
+            return targets;
+        }
+    }
+
+    if command_exists("dpkg-query") {
+        if let Some(path) = pkg.install_path.as_deref() {
+            if let Some(owner_pkg) = resolve_dpkg_owner_from_path(path).await {
+                let mut targets = collect_dpkg_package_paths(&owner_pkg).await;
+                if !targets.is_empty() {
+                    targets.extend(collect_var_data_targets(pkg));
+                    targets.extend(collect_user_data_targets(pkg));
+                    desktop_targets(&mut targets);
+                    return targets;
+                }
+            }
+        }
+    }
+
+    // 2) 其次按来源补充更“贴近真实占用”的路径（即使相关命令缺失，也会回退到通用路径）。
     let mut targets = Vec::new();
-    if pkg.source == "flatpak" {
+    if pkg.source == "flatpak" && command_exists("flatpak") {
         if let Some(app_id) = canonical_name(&pkg.canonical_id) {
             if let Ok(output) =
                 run_command("flatpak", &["info", "--show-location", &app_id], 20).await
@@ -1280,8 +2186,24 @@ async fn collect_candidate_paths(pkg: &SelectedPackage) -> Vec<SizePathCandidate
                     });
                 }
             }
+
+            if let Ok(home) = std::env::var("HOME") {
+                let user_data = format!(
+                    "{}/.var/app/{app_id}",
+                    home.trim_end_matches('/')
+                );
+                let p = Path::new(&user_data);
+                if p.exists() && p.is_dir() {
+                    targets.push(SizePathCandidate {
+                        path: user_data,
+                        recursive: true,
+                    });
+                }
+            }
         }
-    } else if pkg.source == "snap" {
+    }
+
+    if pkg.source == "snap" && command_exists("snap") {
         if let Some(name) = canonical_name(&pkg.canonical_id) {
             if let Ok(output) = run_command("snap", &["info", &name], 20).await {
                 if let Some(installed_size) = parse_snap_installed_size(&output.stdout) {
@@ -1297,47 +2219,89 @@ async fn collect_candidate_paths(pkg: &SelectedPackage) -> Vec<SizePathCandidate
                     }
                 }
             }
-        }
-    } else {
-        if let Some(path) = pkg.install_path.as_deref() {
-            targets.push(SizePathCandidate {
-                path: path.to_string(),
-                recursive: true,
-            });
 
-            if let Some(opt_root) = extract_opt_root(path) {
-                targets.push(SizePathCandidate {
-                    path: opt_root,
-                    recursive: true,
-                });
-            }
-
-            if let Some(name) = Path::new(path)
-                .file_stem()
-                .and_then(|v| v.to_str())
-                .filter(|v| !v.is_empty())
-            {
-                for extra in [
-                    format!("/usr/lib/{name}"),
-                    format!("/usr/share/{name}"),
-                    format!("/usr/local/lib/{name}"),
-                    format!("/usr/local/share/{name}"),
-                ] {
+            if let Ok(home) = std::env::var("HOME") {
+                let user_data = format!("{}/snap/{name}", home.trim_end_matches('/'));
+                let p = Path::new(&user_data);
+                if p.exists() && p.is_dir() {
                     targets.push(SizePathCandidate {
-                        path: extra,
+                        path: user_data,
                         recursive: true,
                     });
                 }
             }
         }
+    }
 
-        if let Some(desktop_file) = pkg.desktop_file.as_deref() {
+    if pkg.install_method == "wine" {
+        if let Some(prefix) = wine_prefix_from_pkg(pkg) {
             targets.push(SizePathCandidate {
-                path: desktop_file.to_string(),
-                recursive: false,
+                path: prefix,
+                recursive: true,
             });
         }
     }
+
+    // 3) 通用回退：安装路径 + 常见扩展目录 + desktop 文件（避免出现“无可统计项”）。
+    if let Some(path) = pkg.install_path.as_deref() {
+        if pkg.install_method == "conda" {
+            if let Some(root) = conda_root_from_install_path(path) {
+                targets.push(SizePathCandidate {
+                    path: root,
+                    recursive: true,
+                });
+            }
+        }
+
+        if let Some(root) = bundle_root_from_install_path(path) {
+            targets.push(SizePathCandidate {
+                path: root,
+                recursive: true,
+            });
+        }
+
+        let trimmed = path.trim_end_matches('/');
+        let broad_dir = trimmed == "/" || trimmed == "/usr";
+        let recursive = if broad_dir {
+            false
+        } else {
+            std::fs::metadata(trimmed).map_or(true, |m| m.is_dir())
+        };
+        targets.push(SizePathCandidate {
+            path: path.to_string(),
+            recursive,
+        });
+
+        if let Some(opt_root) = extract_opt_root(path) {
+            targets.push(SizePathCandidate {
+                path: opt_root,
+                recursive: true,
+            });
+        }
+
+        if let Some(name) = Path::new(path)
+            .file_stem()
+            .and_then(|v| v.to_str())
+            .filter(|v| !v.is_empty())
+        {
+            for extra in [
+                format!("/usr/lib/{name}"),
+                format!("/usr/share/{name}"),
+                format!("/usr/local/lib/{name}"),
+                format!("/usr/local/share/{name}"),
+            ] {
+                targets.push(SizePathCandidate {
+                    path: extra,
+                    recursive: true,
+                });
+            }
+        }
+    }
+
+    targets.extend(collect_var_data_targets(pkg));
+    targets.extend(collect_user_data_targets(pkg));
+
+    desktop_targets(&mut targets);
 
     targets
 }
