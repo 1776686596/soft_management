@@ -44,6 +44,6 @@ jobs:
         with:
           files: |
             dist/*.tar.gz
-            dist/*.sha256
+            dist/*.tar.gz.sha256
             dist/*.deb
             dist/*.deb.sha256
