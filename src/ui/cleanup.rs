@@ -160,13 +160,13 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
             for s in &suggestions {
                 let default_selected = matches!(s.risk_level, RiskLevel::Safe);
 
-                let title_text = glib::markup_escape_text(&s.description);
+                let title_text = glib::markup_escape_text(&suggestion_title(s, lang));
                 let subtitle_text = glib::markup_escape_text(&suggestion_subtitle(s, lang));
                 let row = adw::ActionRow::builder()
                     .title(title_text)
                     .subtitle(subtitle_text)
                     .build();
-                row.set_tooltip_text(Some(&s.command));
+                row.set_tooltip_text(Some(&suggestion_tooltip(s, lang)));
 
                 let check = gtk::CheckButton::new();
                 check.set_valign(gtk::Align::Center);
@@ -423,8 +423,6 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
         let rebuild_list = rebuild_list.clone();
 
         async move {
-            const ADAPTER_TOTAL: usize = 6;
-
             while let Ok(event) = rx.recv().await {
                 if event.scan_id != *active_scan_id.borrow() {
                     continue;
@@ -433,10 +431,11 @@ pub fn build(token: tokio_util::sync::CancellationToken, lang: Language) -> adw:
                 sources_seen.borrow_mut().insert(event.source);
                 suggestions_state.borrow_mut().extend(event.suggestions);
 
-                let done = sources_seen.borrow().len() >= ADAPTER_TOTAL;
+                let total = event.total_sources.max(1);
+                let done = sources_seen.borrow().len() >= total;
                 progress_badge.set_label(&match lang {
-                    Language::ZhCn => format!("扫描中（{}/{}）", sources_seen.borrow().len(), ADAPTER_TOTAL),
-                    Language::En => format!("Scanning ({}/{})", sources_seen.borrow().len(), ADAPTER_TOTAL),
+                    Language::ZhCn => format!("扫描中（{}/{}）", sources_seen.borrow().len(), total),
+                    Language::En => format!("Scanning ({}/{})", sources_seen.borrow().len(), total),
                 });
 
                 if done {
@@ -606,10 +605,127 @@ fn suggestion_subtitle(s: &CleanupSuggestion, lang: Language) -> String {
     } else {
         pick(lang, "无需 sudo", "No sudo")
     };
-    match lang {
+    let mut subtitle = match lang {
         Language::ZhCn => format!("预计释放 {} · {risk} · {sudo}", format_size(s.estimated_bytes)),
         Language::En => format!("Est. free {} · {risk} · {sudo}", format_size(s.estimated_bytes)),
     }
+    ;
+
+    let cmd_text = if s.requires_sudo {
+        format!("sudo {}", s.command)
+    } else {
+        s.command.clone()
+    };
+    subtitle.push_str(&match lang {
+        Language::ZhCn => format!(" · 命令：{cmd_text}"),
+        Language::En => format!(" · Cmd: {cmd_text}"),
+    });
+
+    if !s.targets.is_empty() {
+        let target_text = s.targets.iter().map(|t| display_path(t)).collect::<Vec<_>>().join(", ");
+        subtitle.push_str(&match lang {
+            Language::ZhCn => format!(" · 清理：{target_text}"),
+            Language::En => format!(" · Target: {target_text}"),
+        });
+    }
+
+    if lang == Language::ZhCn && s.command == "pip3 cache purge" {
+        if let Some(first) = s.targets.first() {
+            let p = display_path(first);
+            if !p.is_empty() {
+                subtitle.push_str(&format!(" · 等效：rm -r {p}"));
+            }
+        }
+    }
+
+    subtitle
+}
+
+fn suggestion_title(s: &CleanupSuggestion, lang: Language) -> String {
+    match lang {
+        Language::ZhCn => suggestion_title_zh(s),
+        Language::En => s.description.clone(),
+    }
+}
+
+fn suggestion_title_zh(s: &CleanupSuggestion) -> String {
+    match s.command.as_str() {
+        "apt clean" => "清理 apt 缓存".into(),
+        "apt autoremove --purge" => "清理无用 apt 包（autoremove）".into(),
+        "pip3 cache purge" => "清理 pip 缓存".into(),
+        "npm cache clean --force" => "清理 npm 缓存".into(),
+        "conda clean --all -y" => "清理 conda 缓存".into(),
+        "cargo cache --autoclean" => "清理 cargo registry 缓存".into(),
+        "docker system prune -f" => "清理 Docker 未使用数据".into(),
+        "docker system prune -a --volumes" => "深度清理 Docker（含 volumes）".into(),
+        "journalctl --vacuum-time=7d" => "清理 journal 日志（保留 7 天）".into(),
+        "journalctl --vacuum-size=200M" => "清理 journal 日志（限制 200MB）".into(),
+        _ => {
+            if s.command.starts_with("truncate -s 0 /var/log/") {
+                if let Some(p) = s.targets.first() {
+                    return format!("清空日志文件：{}", display_path(p));
+                }
+                return "清空日志文件".into();
+            }
+            if s.command.starts_with("snap remove ") {
+                let parts: Vec<&str> = s.command.split_whitespace().collect();
+                if parts.len() == 5 && parts[3] == "--revision" {
+                    return format!("删除已禁用的 snap 旧版本：{}（rev {}）", parts[2], parts[4]);
+                }
+                return "清理 snap 旧版本".into();
+            }
+            s.description.clone()
+        }
+    }
+}
+
+fn display_path(path: &str) -> String {
+    let p = path.trim();
+    if p.is_empty() {
+        return String::new();
+    }
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() && p.starts_with(&home) {
+        let rest = p.trim_start_matches(&home);
+        if rest.is_empty() {
+            return "~".into();
+        }
+        if rest.starts_with('/') {
+            return format!("~{rest}");
+        }
+    }
+    p.to_string()
+}
+
+fn suggestion_tooltip(s: &CleanupSuggestion, lang: Language) -> String {
+    let mut lines = Vec::new();
+    lines.push(suggestion_title(s, lang));
+
+    let cmd = if s.requires_sudo {
+        format!("sudo {}", s.command)
+    } else {
+        s.command.clone()
+    };
+    lines.push(match lang {
+        Language::ZhCn => format!("命令：{cmd}"),
+        Language::En => format!("Cmd: {cmd}"),
+    });
+
+    if !s.targets.is_empty() {
+        let target_text = s
+            .targets
+            .iter()
+            .map(|t| display_path(t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(match lang {
+            Language::ZhCn => format!("清理：{target_text}"),
+            Language::En => format!("Target: {target_text}"),
+        });
+    }
+
+    lines.join("\n")
 }
 
 fn build_copy_text(
@@ -676,6 +792,7 @@ mod tests {
         let items = vec![
             CleanupSuggestion {
                 description: "a".into(),
+                targets: Vec::new(),
                 estimated_bytes: 1,
                 command: "apt clean".into(),
                 requires_sudo: true,
@@ -683,6 +800,7 @@ mod tests {
             },
             CleanupSuggestion {
                 description: "b".into(),
+                targets: Vec::new(),
                 estimated_bytes: 2,
                 command: "pip3 cache purge".into(),
                 requires_sudo: false,
@@ -700,6 +818,7 @@ mod tests {
     fn build_copy_text_adds_sudo_prefix() {
         let suggestions_state = Rc::new(RefCell::new(vec![CleanupSuggestion {
             description: "a".into(),
+            targets: Vec::new(),
             estimated_bytes: 1,
             command: "apt clean".into(),
             requires_sudo: true,

@@ -39,16 +39,31 @@ impl CacheAdapter for DockerCacheAdapter {
                 Some(s) if s > 0 => s,
                 _ => return Vec::new(),
             };
-            vec![CleanupSuggestion::new(
+            let mut suggestions = Vec::new();
+            if let Some(mut s) = CleanupSuggestion::new(
                 "Prune unused Docker data".into(),
                 size,
                 "docker system prune -f".into(),
                 false,
                 RiskLevel::Moderate,
-            )]
-            .into_iter()
-            .flatten()
-            .collect()
+            ) {
+                s.targets
+                    .push("Unused containers, networks, images, and build cache".into());
+                suggestions.push(s);
+            }
+            if let Some(mut s) = CleanupSuggestion::new(
+                "Prune ALL Docker data (including volumes)".into(),
+                size,
+                "docker system prune -a --volumes".into(),
+                true,
+                RiskLevel::Moderate,
+            ) {
+                s.targets.push(
+                    "Unused containers, networks, images, build cache, and unused volumes".into(),
+                );
+                suggestions.push(s);
+            }
+            suggestions
         }
     }
 }

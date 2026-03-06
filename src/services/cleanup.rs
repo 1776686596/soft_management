@@ -2,14 +2,18 @@ use crate::adapters::cache::apt_cache::AptCacheAdapter;
 use crate::adapters::cache::cargo_cache::CargoCacheAdapter;
 use crate::adapters::cache::conda_cache::CondaCacheAdapter;
 use crate::adapters::cache::docker_cache::DockerCacheAdapter;
+use crate::adapters::cache::journal_cache::JournalCacheAdapter;
+use crate::adapters::cache::log_cache::LogCacheAdapter;
 use crate::adapters::cache::npm_cache::NpmCacheAdapter;
 use crate::adapters::cache::pip_cache::PipCacheAdapter;
+use crate::adapters::cache::snap_cache::SnapCacheAdapter;
 use crate::adapters::CacheAdapter;
 use crate::models::CleanupSuggestion;
 use tokio::task::JoinSet;
 
 pub struct CleanupEvent {
     pub scan_id: u64,
+    pub total_sources: usize,
     pub source: String,
     pub suggestions: Vec<CleanupSuggestion>,
 }
@@ -22,6 +26,9 @@ fn default_adapters() -> Vec<Box<dyn CacheAdapterBoxed>> {
         Box::new(CondaCacheAdapter),
         Box::new(CargoCacheAdapter),
         Box::new(DockerCacheAdapter),
+        Box::new(JournalCacheAdapter),
+        Box::new(LogCacheAdapter),
+        Box::new(SnapCacheAdapter),
     ]
 }
 
@@ -31,6 +38,7 @@ pub async fn scan_all(
     scan_id: u64,
 ) {
     let adapters = default_adapters();
+    let total_sources = adapters.len();
 
     let mut tasks = JoinSet::new();
 
@@ -69,6 +77,7 @@ pub async fn scan_all(
 
         let event = CleanupEvent {
             scan_id,
+            total_sources,
             source,
             suggestions,
         };
@@ -97,4 +106,3 @@ impl<T: CacheAdapter> CacheAdapterBoxed for T {
         Box::pin(self.suggest_cleanups())
     }
 }
-

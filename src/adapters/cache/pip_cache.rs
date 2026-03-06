@@ -50,16 +50,18 @@ impl CacheAdapter for PipCacheAdapter {
             if size == 0 {
                 return Vec::new();
             }
-            vec![CleanupSuggestion::new(
+            let mut suggestions = Vec::new();
+            if let Some(mut s) = CleanupSuggestion::new(
                 "Purge pip download cache".into(),
                 size,
                 "pip3 cache purge".into(),
                 false,
                 RiskLevel::Safe,
-            )]
-            .into_iter()
-            .flatten()
-            .collect()
+            ) {
+                s.targets.push(path);
+                suggestions.push(s);
+            }
+            suggestions
         }
     }
 }

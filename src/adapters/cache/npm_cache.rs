@@ -50,16 +50,18 @@ impl CacheAdapter for NpmCacheAdapter {
             if size == 0 {
                 return Vec::new();
             }
-            vec![CleanupSuggestion::new(
+            let mut suggestions = Vec::new();
+            if let Some(mut s) = CleanupSuggestion::new(
                 "Clean npm cache".into(),
                 size,
                 "npm cache clean --force".into(),
                 false,
                 RiskLevel::Moderate,
-            )]
-            .into_iter()
-            .flatten()
-            .collect()
+            ) {
+                s.targets.push(path);
+                suggestions.push(s);
+            }
+            suggestions
         }
     }
 }

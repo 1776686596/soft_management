@@ -45,27 +45,34 @@ impl CacheAdapter for CondaCacheAdapter {
                 return Vec::new();
             }
             let home = std::env::var("HOME").unwrap_or_default();
-            let total: u64 = [
+            let mut total: u64 = 0;
+            let mut targets: Vec<String> = Vec::new();
+            for path in [
                 format!("{home}/anaconda3/pkgs"),
                 format!("{home}/miniconda3/pkgs"),
             ]
             .into_iter()
-            .filter(|p| std::path::Path::new(p).exists())
-            .map(|p| dir_size(&p))
-            .sum();
+            {
+                if std::path::Path::new(&path).exists() {
+                    total = total.saturating_add(dir_size(&path));
+                    targets.push(path);
+                }
+            }
             if total == 0 {
                 return Vec::new();
             }
-            vec![CleanupSuggestion::new(
+            let mut suggestions = Vec::new();
+            if let Some(mut s) = CleanupSuggestion::new(
                 "Clean conda package cache and tarballs".into(),
                 total,
                 "conda clean --all -y".into(),
                 false,
                 RiskLevel::Safe,
-            )]
-            .into_iter()
-            .flatten()
-            .collect()
+            ) {
+                s.targets = targets;
+                suggestions.push(s);
+            }
+            suggestions
         }
     }
 }

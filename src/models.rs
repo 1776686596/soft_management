@@ -54,6 +54,7 @@ pub struct CacheInfo {
 #[derive(Clone)]
 pub struct CleanupSuggestion {
     pub description: String,
+    pub targets: Vec<String>,
     pub estimated_bytes: u64,
     pub command: String,
     pub requires_sudo: bool,
@@ -66,14 +67,87 @@ pub enum RiskLevel {
     Moderate,
 }
 
-const CLEANUP_WHITELIST: &[&str] = &[
-    "apt clean",
+const CLEANUP_RUN_WHITELIST: &[&str] = &[
     "pip3 cache purge",
     "npm cache clean --force",
     "conda clean --all -y",
     "cargo cache --autoclean",
     "docker system prune -f",
 ];
+
+const CLEANUP_COPY_WHITELIST: &[&str] = &[
+    "apt clean",
+    "apt autoremove --purge",
+    "journalctl --vacuum-time=7d",
+    "journalctl --vacuum-size=200M",
+    "docker system prune -a --volumes",
+];
+
+fn cleanup_command_allowed(command: &str, requires_sudo: bool) -> bool {
+    if requires_sudo {
+        if CLEANUP_COPY_WHITELIST.contains(&command) {
+            return true;
+        }
+        return cleanup_command_matches_patterns(command);
+    }
+
+    CLEANUP_RUN_WHITELIST.contains(&command)
+}
+
+fn cleanup_command_matches_patterns(command: &str) -> bool {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    is_allowed_snap_remove(&parts) || is_allowed_truncate_var_log(&parts)
+}
+
+fn is_allowed_snap_remove(parts: &[&str]) -> bool {
+    if parts.len() != 5 {
+        return false;
+    }
+    if parts[0] != "snap" || parts[1] != "remove" || parts[3] != "--revision" {
+        return false;
+    }
+    let name = parts[2];
+    let rev = parts[4];
+    if !rev.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    if name.is_empty() || name.len() > 128 {
+        return false;
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return false;
+    }
+    true
+}
+
+fn is_allowed_truncate_var_log(parts: &[&str]) -> bool {
+    if parts.len() != 4 {
+        return false;
+    }
+    if parts[0] != "truncate" || parts[1] != "-s" || parts[2] != "0" {
+        return false;
+    }
+    let path = parts[3];
+    if !path.starts_with("/var/log/") || path.starts_with("/var/log/journal") {
+        return false;
+    }
+    if path.contains("..") || path.len() > 512 {
+        return false;
+    }
+
+    path.chars().all(|ch| {
+        ch.is_ascii_alphanumeric()
+            || ch == '/'
+            || ch == '.'
+            || ch == '-'
+            || ch == '_'
+            || ch == '@'
+            || ch == '+'
+    })
+}
 
 impl CleanupSuggestion {
     pub fn new(
@@ -83,12 +157,13 @@ impl CleanupSuggestion {
         requires_sudo: bool,
         risk_level: RiskLevel,
     ) -> Option<Self> {
-        if !CLEANUP_WHITELIST.contains(&command.as_str()) {
+        if !cleanup_command_allowed(&command, requires_sudo) {
             tracing::warn!("cleanup command not in whitelist: {command}");
             return None;
         }
         Some(Self {
             description,
+            targets: Vec::new(),
             estimated_bytes,
             command,
             requires_sudo,
@@ -193,6 +268,22 @@ mod tests {
             RiskLevel::Moderate
         )
         .is_some());
+        assert!(CleanupSuggestion::new(
+            "t".into(),
+            1,
+            "snap remove cmake --revision 1070".into(),
+            true,
+            RiskLevel::Moderate
+        )
+        .is_some());
+        assert!(CleanupSuggestion::new(
+            "t".into(),
+            1,
+            "truncate -s 0 /var/log/syslog".into(),
+            true,
+            RiskLevel::Moderate
+        )
+        .is_some());
     }
 
     #[test]
@@ -201,6 +292,22 @@ mod tests {
             CleanupSuggestion::new("t".into(), 1, "rm -rf /".into(), false, RiskLevel::Safe)
                 .is_none()
         );
+        assert!(CleanupSuggestion::new(
+            "t".into(),
+            1,
+            "snap remove cmake --revision 1070".into(),
+            false,
+            RiskLevel::Moderate
+        )
+        .is_none());
+        assert!(CleanupSuggestion::new(
+            "t".into(),
+            1,
+            "truncate -s 0 /etc/passwd".into(),
+            true,
+            RiskLevel::Moderate
+        )
+        .is_none());
     }
 
     #[test]

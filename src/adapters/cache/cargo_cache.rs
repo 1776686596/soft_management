@@ -42,16 +42,18 @@ impl CacheAdapter for CargoCacheAdapter {
             if size == 0 {
                 return Vec::new();
             }
-            vec![CleanupSuggestion::new(
+            let mut suggestions = Vec::new();
+            if let Some(mut s) = CleanupSuggestion::new(
                 "Auto-clean cargo registry cache".into(),
                 size,
                 "cargo cache --autoclean".into(),
                 false,
                 RiskLevel::Safe,
-            )]
-            .into_iter()
-            .flatten()
-            .collect()
+            ) {
+                s.targets.push(registry);
+                suggestions.push(s);
+            }
+            suggestions
         }
     }
 }
